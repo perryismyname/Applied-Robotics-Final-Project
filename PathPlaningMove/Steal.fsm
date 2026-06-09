@@ -1,0 +1,223 @@
+from aim_fsm import *
+from math import cos, sin, atan2, hypot
+import time
+
+# ========================================================================================
+# Capture the Flag - Stealing module  (owner: Huy)
+#
+# In CaptureTheFlag:
+#
+#     from Steal import *
+#     ...
+#     steal: StealBarrel(MY_BARREL_TYPES, ENEMY_TAGS, MY_TAGS, ALLOW_STEAL)
+#     steal =D=> StoreBarrel() =D=> turn_to    # drove to a stealable barrel -> pursue it
+#     steal =F=> relocalize                     # nothing to steal -> caller moves on
+#
+# Finds a barrel at an enemy goal (using the world map, not just what's currently visible)
+# drives to a standoff near it, then hands that barrel
+# up to the caller as a DataEvent so the normal pursue path goes after it.
+# =========================================================================================
+
+STEAL_RADIUS_MM   = 120    # CHANGED (was 200): a barrel within this of an enemy tag is "at the enemy goal"
+ALLY_RADIUS_MM    = 75     # ADDED (split from STEAL_RADIUS_MM): own-goal radius; barrel this close to our tag is "dropped"
+STEAL_STANDOFF_MM = 150    # stop at pickup standoff before handing off
+STEAL_MAX_HOPS    = 3      # steal approaches per call before giving up
+STEAL_FAIL_COOLDOWN_SEC = 15   # skip a barrel this long after a failed steal approach
+
+
+
+# Shared barrel-identity helper.  Lives here rather than in its own module
+# because CaptureTheFlag already does `from Steal import *`, so it gets
+# barrel_key for free; it can't live in CaptureTheFlag itself without a circular
+# import (CaptureTheFlag imports Steal).
+def barrel_key(barrel):
+    """Stable, hashable identity for a barrel world-map object, used as the key
+    in the bad_barrels / steal-cooldown sets.  A world-map object
+    keeps a unique string id (e.g. 'OrangeBarrel-1') across pose updates and
+    reclaim-after-missing, so that id is the key; fall back to Python object
+    identity, and None when there is no barrel."""
+    if barrel is None:
+        return None
+    key = getattr(barrel, 'id', None)
+    if key is not None:
+        return key
+    return id(barrel)
+
+
+# Barrels that recently failed a steal approach.  Kept across StealBarrel calls
+# (with an expiry) so steal doesn't thrash re-picking a target it just couldn't
+# reach; the barrel gets another chance once its cooldown lapses.
+_steal_cooldown = {}   # barrel_key -> monotonic time the barrel may be retried
+
+def mark_steal_failed(barrel):
+    """Cool a barrel down after a failed steal approach."""
+    k = barrel_key(barrel)
+    if k is not None:
+        _steal_cooldown[k] = time.monotonic() + STEAL_FAIL_COOLDOWN_SEC
+
+def steal_on_cooldown(barrel):
+    """True while a barrel is still cooling down; prunes expired entries."""
+    now = time.monotonic()
+    for k in [k for k, t in _steal_cooldown.items() if t <= now]:
+        del _steal_cooldown[k]
+    return barrel_key(barrel) in _steal_cooldown
+
+
+def _tag_xy(robot, tag_ids):
+    out = {}
+    for tid in tag_ids:
+        obj = robot.world_map.objects.get('AprilTag-%s.a' % tid)
+        if obj is not None:
+            out[tid] = (obj.pose.x, obj.pose.y)
+    for obj in robot.world_map.objects.values():
+        if isinstance(obj, ArucoMarkerObj):
+            tid = getattr(obj, 'id', None)
+            if tid in tag_ids and tid not in out:
+                out[tid] = (obj.pose.x, obj.pose.y)
+    return out
+
+
+def _near_any(bx, by, xy_list, radius):
+    return any(hypot(bx - ox, by - oy) <= radius for ox, oy in xy_list)
+
+
+class StealBarrel(StateNode):
+    """
+    Outcomes to the caller:
+      =D=> (DataEvent: barrel)  drove to a stealable barrel; event data is that
+                                barrel object, ready for the pursue path.
+      =F=> (ParentFails)        stealing off, no enemy tag mapped, nothing to
+                                steal, or hops exhausted.
+
+    Constructor args (passed from CaptureTheFlag):
+      barrel_types : barrel classes to consider   (MY_BARREL_TYPES)
+      enemy_tags   : enemy ArUco ids               (ENEMY_TAGS)
+      my_tags      : own ArUco ids                 (MY_TAGS)
+      allow_steal  : master on/off                 (ALLOW_STEAL)
+    """
+    def __init__(self, barrel_types=BarrelObj, enemy_tags=(), my_tags=(), allow_steal=True, bad_barrels=None):
+        super().__init__()
+        self.barrel_types     = barrel_types
+        self.enemy_tags       = enemy_tags
+        self.my_tags          = my_tags
+        self.allow_steal      = allow_steal
+        self.bad_barrels      = bad_barrels if bad_barrels is not None else set()
+        self.hops             = 0
+        self.steal_barrel     = None
+
+    class ResetHops(StateNode):
+        """Start each steal attempt fresh.  The previous version kept the
+        hop count forever, so after one exhausted steal sequence it would never
+        steal again."""
+        def start(self, event=None):
+            super().start(event)
+            self.parent.hops = 0
+            self.parent.steal_barrel = None
+            self.post_completion()
+
+    class FindStealTarget(StateNode):
+        """
+        Picks the barrel parked at an enemy goal, stores it on the parent, and
+        posts a standoff Pose to drive to.
+          =D=> standoff Pose;  =F=> nothing to steal.
+        """
+        def start(self, event=None):
+            super().start(event)
+            p = self.parent
+            if not p.allow_steal or p.hops >= STEAL_MAX_HOPS:
+                self.post_failure()
+                return
+            # If we're back here after a nav failure, the previous target is
+            # unreachable right now -- cool it down so this hop (and the next few
+            # steal calls) try a DIFFERENT one.
+            if p.steal_barrel is not None:
+                mark_steal_failed(p.steal_barrel)
+            enemy_xy = _tag_xy(self.robot, p.enemy_tags)
+            if not enemy_xy:
+                self.post_failure()           # no enemy tag mapped -> can't steal
+                return
+            enemy_pts = list(enemy_xy.values())
+            own_pts   = list(_tag_xy(self.robot, p.my_tags).values())
+            rx, ry = self.robot.pose.x, self.robot.pose.y
+            best, best_d = None, None
+            for obj in self.robot.world_map.objects.values():
+                if not isinstance(obj, p.barrel_types):
+                    continue
+                key = barrel_key(obj)
+                if key in p.bad_barrels or steal_on_cooldown(obj):
+                    continue
+                bx, by = obj.pose.x, obj.pose.y
+                if not _near_any(bx, by, enemy_pts, STEAL_RADIUS_MM):
+                    continue                  # not parked at an enemy goal
+                if own_pts and _near_any(bx, by, own_pts, ALLY_RADIUS_MM):
+                    continue                  # also at our goal -> not a steal
+                d_robot = hypot(bx - rx, by - ry)
+                if best_d is None or d_robot < best_d:
+                    best, best_d = obj, d_robot   # nearest stealable to the robot
+            if best is None:
+                self.post_failure()
+                return
+            p.hops += 1
+            p.steal_barrel = best             # remember it to hand up after we arrive
+            bx, by = best.pose.x, best.pose.y
+
+            # Do NOT approach from the field-center side.  If the barrel is
+            # parked at an enemy tag, a center-side final approach pushes the
+            # barrel deeper into that enemy tag before pickup.  Instead, choose
+            # a side-approach relative to the closest enemy tag so the intake
+            # nudges the barrel sideways/off the tag instead of straight toward
+            # it.
+            nearest_enemy = min(enemy_xy.values(),
+                                key=lambda xy: hypot(bx - xy[0], by - xy[1]))
+            ex, ey = nearest_enemy
+            vx, vy = bx - ex, by - ey
+            vlen = hypot(vx, vy)
+            if vlen < 20:
+                # Barrel is essentially on top of the tag.  Use the vector
+                # from the enemy tag toward field center as the tag->field axis.
+                vx, vy = 0.0 - ex, 0.0 - ey
+                vlen = hypot(vx, vy)
+            if vlen < 1:
+                vx, vy, vlen = 1.0, 0.0, 1.0
+            ux, uy = vx / vlen, vy / vlen
+            sx, sy = -uy, ux       # perpendicular side approach direction
+
+            # Pick the side candidate closer to the robot, unless one side is
+            # clearly closer to an enemy tag obstacle.
+            candidates = []
+            rx, ry = self.robot.pose.x, self.robot.pose.y
+            for sign in (1, -1):
+                px = bx + sign * STEAL_STANDOFF_MM * sx
+                py = by + sign * STEAL_STANDOFF_MM * sy
+                d_robot = hypot(px - rx, py - ry)
+                d_enemy = min(hypot(px - tx, py - ty) for tx, ty in enemy_xy.values())
+                candidates.append((d_enemy < 90, d_robot, px, py))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            _, _, px, py = candidates[0]
+            heading = atan2(by - py, bx - px)
+            print("StealBarrel: side-approach %s from (%.1f, %.1f), not center-side push into enemy tag"
+                  % (best, px, py))
+            self.post_data(Pose(px, py, theta=heading))   # matches framework: Pose(x,y,theta=)
+
+    class EmitStealBarrel(StateNode):
+        """Hand the remembered stealable barrel up to the caller (StealBarrel
+        posts a DataEvent -> its =D=> fires)."""
+        def start(self, event=None):
+            super().start(event)
+            self.parent.post_data(self.parent.steal_barrel)
+
+    $setup {
+        s_begin: self.ResetHops()
+        s_begin =C=> s_find
+
+        s_find: self.FindStealTarget()
+        s_find =D=> s_go
+        s_find =F=> ParentFails()
+
+        s_go: PilotToPose()                  # consumes the posted Pose
+        s_go =C=> s_emit                     # arrived near it -> hand the barrel up
+        s_go =F=> s_find                     # nav failed -> try another (bounded by 3 hops)
+        s_go =PILOT=> s_find
+
+        s_emit: self.EmitStealBarrel()
+    }
